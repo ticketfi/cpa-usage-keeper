@@ -121,23 +121,60 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PACKAGE_NAME: cpa-usage-keeper
+          IMAGE_TAG: ${{ steps.repo.outputs.tag }}
           IMAGE_TAG_NAME: sha-${{ github.sha }}
         run: |
           set +e
-          package_versions="$(gh api --paginate "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE_NAME}/versions" 2>package-query.err)"
+          package_pages="$(gh api --paginate --slurp "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE_NAME}/versions" 2>package-query.err)"
           query_status=$?
           set -e
           if [[ $query_status -ne 0 ]]; then
             if grep -q 'HTTP 404' package-query.err; then
-              package_versions='[]'
+              package_pages='[[]]'
             else
               echo 'Could not prove current package tags before publishing.' >&2
               cat package-query.err >&2
               exit 1
             fi
           fi
-          if jq -e --arg tag "$IMAGE_TAG_NAME" '.[] | select((.metadata.container.tags // []) | index($tag))' <<<"$package_versions" >/dev/null; then
+
+          set +e
+          tag_exists="$(jq -r --arg tag "$IMAGE_TAG_NAME" '
+            if type != "array" or any(.[]; type != "array") then
+              error("unexpected package-version page shape")
+            elif any(.[][];
+              (.metadata | type) != "object" or
+              (.metadata.container | type) != "object" or
+              (.metadata.container.tags | type) != "array" or
+              any(.metadata.container.tags[]; type != "string")) then
+              error("unexpected package-version tag shape")
+            else
+              any(.[][]; (.metadata.container.tags | index($tag)) != null)
+            end
+          ' <<<"$package_pages" 2>package-parse.err)"
+          parse_status=$?
+          set -e
+          if [[ $parse_status -ne 0 || ( "$tag_exists" != 'true' && "$tag_exists" != 'false' ) ]]; then
+            echo 'Could not prove package tag state from the API response.' >&2
+            cat package-parse.err >&2
+            exit 1
+          fi
+          if [[ "$tag_exists" == 'true' ]]; then
             echo "Refusing to overwrite existing image tag: $IMAGE_TAG_NAME" >&2
+            exit 1
+          fi
+
+          set +e
+          inspect_output="$(docker buildx imagetools inspect "$IMAGE_TAG" 2>&1)"
+          inspect_status=$?
+          set -e
+          if [[ $inspect_status -eq 0 ]]; then
+            echo "Refusing to overwrite existing registry tag: $IMAGE_TAG" >&2
+            exit 1
+          fi
+          if ! grep -Eiq 'manifest unknown|name unknown|404 Not Found' <<<"$inspect_output"; then
+            echo 'The authenticated registry probe did not prove exact-tag absence.' >&2
+            echo "$inspect_output" >&2
             exit 1
           fi
 
