@@ -20,6 +20,9 @@ ARG VERSION=dev
 RUN CGO_ENABLED=1 GOOS=linux go build \
     -ldflags="-s -w -X cpa-usage-keeper/internal/version.Version=${VERSION}" \
     -o /out/cpa-usage-keeper ./cmd/server/main.go
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -ldflags="-s -w" \
+    -o /out/cpa-usage-keeper-latency-repair ./cmd/cpa-usage-keeper-latency-repair/main.go
 
 FROM alpine:3.20
 WORKDIR /
@@ -29,6 +32,7 @@ RUN apk add --no-cache ca-certificates tzdata su-exec \
 	&& mkdir -p /data \
 	&& chown -R app:app /data
 COPY --from=go-builder /out/cpa-usage-keeper /app/cpa-usage-keeper
+COPY --from=go-builder /out/cpa-usage-keeper-latency-repair /app/cpa-usage-keeper-latency-repair
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/docker-entrypoint.sh \
 	&& chmod +x /usr/local/bin/docker-entrypoint.sh

@@ -1,0 +1,288 @@
+name: TicketFi repair image
+
+on:
+  pull_request:
+    branches:
+      - release/ticketfi-v1.14.4-repair
+  push:
+    branches:
+      - release/ticketfi-v1.14.4-repair
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ticketfi-repair-image-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-repair-image:
+    name: Validate and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run backend tests
+        run: go test ./cmd/... ./internal/...
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Validate multi-platform repair image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: false
+          provenance: false
+          build-args: |
+            VERSION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  reject-unprotected-publish:
+    name: Reject unprotected publication
+    if: >-
+      github.event_name == 'push' &&
+      (github.repository != 'ticketfi/cpa-usage-keeper' ||
+       github.ref != 'refs/heads/release/ticketfi-v1.14.4-repair' ||
+       github.ref_type != 'branch' ||
+       !github.ref_protected)
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Reject untrusted publication source
+        run: |
+          echo 'Refusing to publish: this run is not an exact protected TicketFi release-branch push.' >&2
+          exit 1
+
+  publish-repair-image:
+    name: Publish immutable repair image
+    needs: validate-repair-image
+    if: >-
+      github.event_name == 'push' &&
+      github.repository == 'ticketfi/cpa-usage-keeper' &&
+      github.ref == 'refs/heads/release/ticketfi-v1.14.4-repair' &&
+      github.ref_type == 'branch' &&
+      github.ref_protected
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Select sole immutable tag
+        id: repo
+        shell: bash
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "tag=${image}:sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Require the immutable tag to be absent
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_NAME: cpa-usage-keeper
+          IMAGE_TAG: ${{ steps.repo.outputs.tag }}
+          IMAGE_TAG_NAME: sha-${{ github.sha }}
+        run: |
+          set +e
+          package_pages="$(gh api --paginate --slurp "/orgs/${GITHUB_REPOSITORY_OWNER}/packages/container/${PACKAGE_NAME}/versions" 2>package-query.err)"
+          query_status=$?
+          set -e
+          if [[ $query_status -ne 0 ]]; then
+            if grep -q 'HTTP 404' package-query.err; then
+              package_pages='[[]]'
+            else
+              echo 'Could not prove current package tags before publishing.' >&2
+              cat package-query.err >&2
+              exit 1
+            fi
+          fi
+
+          set +e
+          tag_exists="$(jq -r --arg tag "$IMAGE_TAG_NAME" '
+            if type != "array" or any(.[]; type != "array") then
+              error("unexpected package-version page shape")
+            elif any(.[][];
+              (.metadata | type) != "object" or
+              (.metadata.container | type) != "object" or
+              (.metadata.container.tags | type) != "array" or
+              any(.metadata.container.tags[]; type != "string")) then
+              error("unexpected package-version tag shape")
+            else
+              any(.[][]; (.metadata.container.tags | index($tag)) != null)
+            end
+          ' <<<"$package_pages" 2>package-parse.err)"
+          parse_status=$?
+          set -e
+          if [[ $parse_status -ne 0 || ( "$tag_exists" != 'true' && "$tag_exists" != 'false' ) ]]; then
+            echo 'Could not prove package tag state from the API response.' >&2
+            cat package-parse.err >&2
+            exit 1
+          fi
+          if [[ "$tag_exists" == 'true' ]]; then
+            echo "Refusing to overwrite existing image tag: $IMAGE_TAG_NAME" >&2
+            exit 1
+          fi
+
+          set +e
+          inspect_output="$(docker buildx imagetools inspect "$IMAGE_TAG" 2>&1)"
+          inspect_status=$?
+          set -e
+          if [[ $inspect_status -eq 0 ]]; then
+            echo "Refusing to overwrite existing registry tag: $IMAGE_TAG" >&2
+            exit 1
+          fi
+          if ! grep -Eiq 'manifest unknown|name unknown|404 Not Found' <<<"$inspect_output"; then
+            echo 'The authenticated registry probe did not prove exact-tag absence.' >&2
+            echo "$inspect_output" >&2
+            exit 1
+          fi
+
+      - name: Publish repair image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          build-args: |
+            VERSION=${{ github.sha }}
+          tags: ${{ steps.repo.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Verify registry digest and platforms
+        id: registry
+        shell: bash
+        env:
+          EXPECTED_DIGEST: ${{ steps.build.outputs.digest }}
+          IMAGE_TAG: ${{ steps.repo.outputs.tag }}
+        run: |
+          manifest_json="$(docker buildx imagetools inspect "$IMAGE_TAG" --format '{{json .Manifest}}')"
+          registry_digest="$(jq -er '.digest' <<<"$manifest_json")"
+          platforms="$(jq -er '[.manifests[].platform | select(.os == "linux") | .architecture] | unique | sort | join(",")' <<<"$manifest_json")"
+          if [[ "$registry_digest" != "$EXPECTED_DIGEST" ]]; then
+            echo "Registry digest mismatch: expected $EXPECTED_DIGEST, got $registry_digest" >&2
+            exit 1
+          fi
+          if [[ "$platforms" != 'amd64,arm64' ]]; then
+            echo "Unexpected platform set: $platforms" >&2
+            exit 1
+          fi
+          echo "digest=$registry_digest" >> "$GITHUB_OUTPUT"
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+
+      - name: Attest protected image provenance
+        id: attest
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ steps.repo.outputs.image }}
+          subject-digest: ${{ steps.registry.outputs.digest }}
+          push-to-registry: true
+
+      - name: Write publication receipt
+        id: receipt
+        shell: bash
+        env:
+          IMAGE: ${{ steps.repo.outputs.image }}
+          IMAGE_TAG: ${{ steps.repo.outputs.tag }}
+          REGISTRY_DIGEST: ${{ steps.registry.outputs.digest }}
+          PLATFORMS: ${{ steps.registry.outputs.platforms }}
+          ATTESTATION_ID: ${{ steps.attest.outputs.attestation-id }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+        run: |
+          jq -n \
+            --arg schemaVersion 'ticketfi-cpa-usage-keeper-publication/v1' \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg commit "$GITHUB_SHA" \
+            --arg workflowCommit '${{ github.workflow_sha }}' \
+            --arg ref "$GITHUB_REF" \
+            --argjson refProtected '${{ github.ref_protected }}' \
+            --arg event "$GITHUB_EVENT_NAME" \
+            --arg runId "$GITHUB_RUN_ID" \
+            --arg runAttempt "$GITHUB_RUN_ATTEMPT" \
+            --arg runUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg image "$IMAGE" \
+            --arg tag "$IMAGE_TAG" \
+            --arg digest "$REGISTRY_DIGEST" \
+            --arg platforms "$PLATFORMS" \
+            --arg attestationId "$ATTESTATION_ID" \
+            --arg attestationUrl "$ATTESTATION_URL" \
+            '{
+              schemaVersion: $schemaVersion,
+              repository: $repository,
+              commit: $commit,
+              workflowCommit: $workflowCommit,
+              ref: $ref,
+              refProtected: $refProtected,
+              event: $event,
+              runId: $runId,
+              runAttempt: $runAttempt,
+              runUrl: $runUrl,
+              image: $image,
+              tag: $tag,
+              digest: $digest,
+              platforms: ($platforms | split(",")),
+              attestation: {id: $attestationId, url: $attestationUrl}
+            }' > ticketfi-repair-image-receipt.json
+          receipt_sha256="$(sha256sum ticketfi-repair-image-receipt.json | cut -d ' ' -f 1)"
+          echo "sha256=$receipt_sha256" >> "$GITHUB_OUTPUT"
+          {
+            echo '### TicketFi repair image publication'
+            echo
+            echo "- Image: \`$IMAGE@$REGISTRY_DIGEST\`"
+            echo "- Platforms: \`$PLATFORMS\`"
+            echo "- Receipt SHA-256: \`$receipt_sha256\`"
+            echo "- Attestation: $ATTESTATION_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload publication receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ticketfi-repair-image-receipt-${{ github.sha }}
+          path: ticketfi-repair-image-receipt.json
+          if-no-files-found: error
+          retention-days: 90
