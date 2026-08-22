@@ -172,7 +172,8 @@ jobs:
             echo "Refusing to overwrite existing registry tag: $IMAGE_TAG" >&2
             exit 1
           fi
-          if ! grep -Eiq 'manifest unknown|name unknown|404 Not Found' <<<"$inspect_output"; then
+          if ! grep -Eiq 'manifest unknown|name unknown|404 Not Found' <<<"$inspect_output" &&
+             [[ "$inspect_output" != "ERROR: ${IMAGE_TAG}: not found" ]]; then
             echo 'The authenticated registry probe did not prove exact-tag absence.' >&2
             echo "$inspect_output" >&2
             exit 1
