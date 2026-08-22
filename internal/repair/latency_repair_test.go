@@ -226,6 +226,7 @@ func TestReplayManifestUsesExplicitStorageColumnsAcrossSchemaExtension(t *testin
 	if err != nil {
 		t.Fatalf("open SQLite: %v", err)
 	}
+	defer closeRepairDB(db)
 	columns := strings.Split(entities.UsageEventStorageColumns, ", ")
 	definitions := make([]string, 0, len(columns))
 	for _, column := range columns {
@@ -258,6 +259,24 @@ func TestReplayManifestUsesExplicitStorageColumnsAcrossSchemaExtension(t *testin
 	}
 	if manifest.Union.Count != 2 || manifest.Union.MinID != 1 || manifest.Union.MaxID != 2 {
 		t.Fatalf("unexpected explicit-column union manifest: %+v", manifest.Union)
+	}
+}
+
+func TestSQLiteFileURIHandlesWindowsDrivePaths(t *testing.T) {
+	uri := sqliteFileURIForGOOS(`D:\a\_temp\source.db`, "mode=ro&immutable=1", "windows")
+	if uri != "file:///D:/a/_temp/source.db?mode=ro&immutable=1" {
+		t.Fatalf("unexpected Windows file URI: %s", uri)
+	}
+}
+
+func TestSQLiteFileURIKeepsPosixBackslashDistinct(t *testing.T) {
+	withBackslash := sqliteFileURIForGOOS(`/tmp/a\b.db`, "mode=ro&immutable=1", "linux")
+	withSlash := sqliteFileURIForGOOS(`/tmp/a/b.db`, "mode=ro&immutable=1", "linux")
+	if withBackslash == withSlash {
+		t.Fatalf("distinct POSIX paths aliased to one URI: %s", withBackslash)
+	}
+	if !strings.Contains(withBackslash, `%5C`) {
+		t.Fatalf("POSIX backslash was not preserved as path data: %s", withBackslash)
 	}
 }
 

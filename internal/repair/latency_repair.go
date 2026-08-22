@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -811,7 +812,7 @@ func openPair(sourcePath, candidatePath string) (*gorm.DB, *gorm.DB, func(), err
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("open source SQLite database: %w", err)
 	}
-	candidate, err := gorm.Open(sqlite.Open("file:"+candidatePath+"?mode=rw&_busy_timeout=5000"), &gorm.Config{SkipDefaultTransaction: true})
+	candidate, err := gorm.Open(sqlite.Open(sqliteFileURI(candidatePath, "mode=rw&_busy_timeout=5000")), &gorm.Config{SkipDefaultTransaction: true})
 	if err != nil {
 		closeGormDatabase(source)
 		return nil, nil, nil, fmt.Errorf("open candidate SQLite database: %w", err)
@@ -839,7 +840,7 @@ func openTriple(sourcePath, candidatePath, stageCandidatePath string) (*gorm.DB,
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("open source SQLite database: %w", err)
 	}
-	candidate, err := gorm.Open(sqlite.Open("file:"+candidatePath+"?mode=rw&_busy_timeout=5000"), &gorm.Config{SkipDefaultTransaction: true})
+	candidate, err := gorm.Open(sqlite.Open(sqliteFileURI(candidatePath, "mode=rw&_busy_timeout=5000")), &gorm.Config{SkipDefaultTransaction: true})
 	if err != nil {
 		closeGormDatabase(source)
 		return nil, nil, nil, nil, fmt.Errorf("open candidate SQLite database: %w", err)
@@ -861,8 +862,35 @@ func openTriple(sourcePath, candidatePath, stageCandidatePath string) (*gorm.DB,
 func openSQLiteReadOnly(path string) (*gorm.DB, error) {
 	// Immutable and query-only make the source/stage inputs a read surface: no
 	// journal creation, lock promotion, or accidental write pragma is allowed.
-	uri := (&url.URL{Scheme: "file", Path: path, RawQuery: "mode=ro&immutable=1&_query_only=1&_busy_timeout=5000"}).String()
-	return gorm.Open(sqlite.Open(uri), &gorm.Config{SkipDefaultTransaction: true})
+	return gorm.Open(sqlite.Open(sqliteFileURI(path, "mode=ro&immutable=1&_query_only=1&_busy_timeout=5000")), &gorm.Config{SkipDefaultTransaction: true})
+}
+
+func sqliteFileURI(path, rawQuery string) string {
+	return sqliteFileURIForGOOS(path, rawQuery, runtime.GOOS)
+}
+
+// sqliteFileURIForGOOS expects an absolute path. The repair entrypoints enforce
+// that contract before opening any database. Windows separators must only be
+// rewritten for Windows paths: a backslash is a valid filename byte on POSIX,
+// and rewriting it there could alias two files that passed the distinct-path
+// safety checks.
+func sqliteFileURIForGOOS(path, rawQuery, goos string) string {
+	uriPath := filepath.ToSlash(path)
+	if goos == "windows" {
+		uriPath = strings.ReplaceAll(path, `\`, "/")
+	}
+	if looksLikeWindowsAbsoluteDrivePath(uriPath) && !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	return (&url.URL{Scheme: "file", Path: uriPath, RawQuery: rawQuery}).String()
+}
+
+func looksLikeWindowsAbsoluteDrivePath(path string) bool {
+	if len(path) < 3 || path[1] != ':' || path[2] != '/' {
+		return false
+	}
+	drive := path[0]
+	return ('A' <= drive && drive <= 'Z') || ('a' <= drive && drive <= 'z')
 }
 
 func closeGormDatabase(db *gorm.DB) {
