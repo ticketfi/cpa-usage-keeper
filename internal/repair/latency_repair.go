@@ -38,6 +38,12 @@ const (
 	forkSourceCommit = "d62cad3f345ae574089a14a4ac75cca023c7ead6"
 )
 
+// ErrUnsupportedPlatform is returned before any repair path is inspected or
+// mutated when the host cannot enforce the receipt durability and privacy
+// contract. The published repair image is Linux-only; macOS is supported for
+// controlled local validation.
+var ErrUnsupportedPlatform = errors.New("offline latency repair is unsupported on Windows")
+
 // StageOptions identifies an immutable source database, a separately copied
 // candidate database, the output receipt, and the native aggregation instant.
 type StageOptions struct {
@@ -113,6 +119,9 @@ type DeltaReceipt struct {
 // Stage clears only candidate latency state, replays archive and the fixed S0
 // hot partition in native page order, and writes a receipt for delta.
 func Stage(options StageOptions) (StageReceipt, error) {
+	if err := requireSupportedRepairPlatform(); err != nil {
+		return StageReceipt{}, err
+	}
 	return withToronto(func() (StageReceipt, error) {
 		now, err := requireNow(options.Now)
 		if err != nil {
@@ -222,6 +231,9 @@ func Stage(options StageOptions) (StageReceipt, error) {
 // Delta validates both the old receipt prefix and candidate cursor, then uses
 // the native codec for only IDs after the stage snapshot.
 func Delta(options DeltaOptions) (DeltaReceipt, error) {
+	if err := requireSupportedRepairPlatform(); err != nil {
+		return DeltaReceipt{}, err
+	}
 	return withToronto(func() (DeltaReceipt, error) {
 		now, err := requireNow(options.Now)
 		if err != nil {
@@ -875,7 +887,7 @@ func sqliteFileURI(path, rawQuery string) string {
 // and rewriting it there could alias two files that passed the distinct-path
 // safety checks.
 func sqliteFileURIForGOOS(path, rawQuery, goos string) string {
-	uriPath := filepath.ToSlash(path)
+	uriPath := path
 	if goos == "windows" {
 		uriPath = strings.ReplaceAll(path, `\`, "/")
 	}
@@ -1081,6 +1093,13 @@ func writeImmutableJSON(path string, value any) error {
 	defer parent.Close()
 	if err := parent.Sync(); err != nil {
 		return fmt.Errorf("sync receipt parent directory: %w", err)
+	}
+	return nil
+}
+
+func requireSupportedRepairPlatform() error {
+	if runtime.GOOS == "windows" {
+		return ErrUnsupportedPlatform
 	}
 	return nil
 }

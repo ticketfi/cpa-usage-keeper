@@ -3,9 +3,11 @@ package repair
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +20,7 @@ import (
 )
 
 func TestStageThenDeltaUsesNativeReplayAndPreservesNonLatencyState(t *testing.T) {
+	requireRepairIntegrationPlatform(t)
 	location, err := time.LoadLocation("America/Toronto")
 	if err != nil {
 		t.Fatalf("load Toronto: %v", err)
@@ -131,6 +134,7 @@ func TestStageThenDeltaUsesNativeReplayAndPreservesNonLatencyState(t *testing.T)
 }
 
 func TestStageRefusesInPlaceMutationAndInterleavedPartition(t *testing.T) {
+	requireRepairIntegrationPlatform(t)
 	location, err := time.LoadLocation("America/Toronto")
 	if err != nil {
 		t.Fatalf("load Toronto: %v", err)
@@ -152,6 +156,7 @@ func TestStageRefusesInPlaceMutationAndInterleavedPartition(t *testing.T) {
 }
 
 func TestReceiptAndStageInputGuards(t *testing.T) {
+	requireRepairIntegrationPlatform(t)
 	location, err := time.LoadLocation("America/Toronto")
 	if err != nil {
 		t.Fatalf("load Toronto: %v", err)
@@ -278,6 +283,77 @@ func TestSQLiteFileURIKeepsPosixBackslashDistinct(t *testing.T) {
 	if !strings.Contains(withBackslash, `%5C`) {
 		t.Fatalf("POSIX backslash was not preserved as path data: %s", withBackslash)
 	}
+}
+
+func TestStageAndDeltaRejectUnsupportedWindowsBeforePathAccess(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-only ErrUnsupportedPlatform contract")
+	}
+	directory := t.TempDir()
+	sourcePath := filepath.Join(directory, "sentinel-source.db")
+	sourceBytes := []byte("must remain untouched")
+	if err := os.WriteFile(sourcePath, sourceBytes, 0o600); err != nil {
+		t.Fatalf("write sentinel source: %v", err)
+	}
+	beforeInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		t.Fatalf("stat sentinel source: %v", err)
+	}
+	beforeEntries := directoryEntryNames(t, directory)
+	beforeDigest := fileDigest(t, sourcePath)
+
+	stageOptions := StageOptions{
+		SourcePath:    sourcePath,
+		CandidatePath: filepath.Join(directory, "candidate.db"),
+		ReceiptPath:   filepath.Join(directory, "stage.json"),
+	}
+	if _, err := Stage(stageOptions); !errors.Is(err, ErrUnsupportedPlatform) {
+		t.Fatalf("Stage error=%v, want ErrUnsupportedPlatform", err)
+	}
+	deltaOptions := DeltaOptions{
+		SourcePath:         sourcePath,
+		CandidatePath:      filepath.Join(directory, "delta-candidate.db"),
+		StageCandidatePath: filepath.Join(directory, "stage-candidate.db"),
+		ReceiptPath:        filepath.Join(directory, "stage.json"),
+		OutputPath:         filepath.Join(directory, "delta.json"),
+	}
+	if _, err := Delta(deltaOptions); !errors.Is(err, ErrUnsupportedPlatform) {
+		t.Fatalf("Delta error=%v, want ErrUnsupportedPlatform", err)
+	}
+
+	afterInfo, err := os.Stat(sourcePath)
+	if err != nil {
+		t.Fatalf("restat sentinel source: %v", err)
+	}
+	if got := fileDigest(t, sourcePath); got != beforeDigest {
+		t.Fatalf("sentinel source digest changed: got %s, want %s", got, beforeDigest)
+	}
+	if afterInfo.Size() != beforeInfo.Size() || !afterInfo.ModTime().Equal(beforeInfo.ModTime()) {
+		t.Fatalf("sentinel source metadata changed: before=%+v after=%+v", beforeInfo, afterInfo)
+	}
+	if afterEntries := directoryEntryNames(t, directory); afterEntries != beforeEntries {
+		t.Fatalf("unsupported calls changed directory entries: before=%q after=%q", beforeEntries, afterEntries)
+	}
+}
+
+func requireRepairIntegrationPlatform(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("ErrUnsupportedPlatform: receipt privacy and directory durability cannot be enforced on Windows")
+	}
+}
+
+func directoryEntryNames(t *testing.T, path string) string {
+	t.Helper()
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatalf("read directory %s: %v", path, err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return strings.Join(names, "\x00")
 }
 
 func makeRepairPair(t *testing.T, now time.Time) (string, string) {
