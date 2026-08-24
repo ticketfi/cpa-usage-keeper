@@ -133,6 +133,112 @@ func TestStageThenDeltaUsesNativeReplayAndPreservesNonLatencyState(t *testing.T)
 	}
 }
 
+func TestStageThenDeltaCreatesMissingLatencyCheckpointFromSparseUnion(t *testing.T) {
+	requireRepairIntegrationPlatform(t)
+	location, err := time.LoadLocation("America/Toronto")
+	if err != nil {
+		t.Fatalf("load Toronto: %v", err)
+	}
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, location)
+	sourcePath, stageCandidatePath := makeSparseMissingCheckpointRepairPair(t, now)
+	sourceBeforeStage := fileDigest(t, sourcePath)
+	stagePath := filepath.Join(t.TempDir(), "missing-checkpoint-stage.json")
+	repairImage := testRepairImage()
+
+	stage, err := Stage(StageOptions{SourcePath: sourcePath, CandidatePath: stageCandidatePath, ReceiptPath: stagePath, Now: now, RepairImage: repairImage, ExpiresAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatalf("Stage returned error for missing checkpoint: %v", err)
+	}
+	if stage.ArchiveReplayCursor != 4 || stage.StageReplayCursor != 12 || stage.StageUnionMaxID != 12 || stage.Partition.Archive.Count != 2 || stage.Partition.Hot.Count != 2 {
+		t.Fatalf("unexpected sparse stage receipt: %+v", stage)
+	}
+	if sourceAfterStage := fileDigest(t, sourcePath); sourceAfterStage != sourceBeforeStage {
+		t.Fatal("stage mutated the missing-checkpoint source SQLite file")
+	}
+
+	stageCandidate := openReadRepairDB(t, stageCandidatePath)
+	assertLatencyCheckpoint(t, stageCandidate, 12)
+	assertLatencySampleCounts(t, stageCandidate, 4)
+	closeRepairDB(stageCandidate)
+	if err := clearCheckpointedSQLiteSidecars(stageCandidatePath); err != nil {
+		t.Fatalf("clear stage candidate read-only sidecars: %v", err)
+	}
+
+	source := openRepairDB(t, sourcePath)
+	trueValue := true
+	if err := source.Create(&entities.UsageEvent{ID: 20, EventKey: "hot-20", APIGroupKey: "group-a", Timestamp: now.Add(-time.Minute), Generate: &trueValue, TTFTMS: int64Pointer(150), LatencyMS: 800}).Error; err != nil {
+		t.Fatalf("append sparse delta event: %v", err)
+	}
+	settingValue := "survives-missing-checkpoint-delta"
+	if err := source.Create(&entities.AppSetting{SettingKey: "missing-checkpoint-repair-test", Value: &settingValue, ValueType: entities.AppSettingValueTypeJSON, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("append unrelated sparse S1 state: %v", err)
+	}
+	closeRepairDB(source)
+	frozenCandidatePath := copySQLiteFile(t, sourcePath, "missing-checkpoint-frozen-s1.db")
+	sourceBeforeDelta := fileDigest(t, sourcePath)
+
+	delta, err := Delta(DeltaOptions{SourcePath: sourcePath, CandidatePath: frozenCandidatePath, StageCandidatePath: stageCandidatePath, StageCandidateSHA256: fileDigest(t, stageCandidatePath), ReceiptPath: stagePath, OutputPath: filepath.Join(t.TempDir(), "missing-checkpoint-delta.json"), Now: now, RepairImage: repairImage, ExpiresAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatalf("Delta returned error for missing checkpoint: %v", err)
+	}
+	if delta.Applied.Count != 1 || delta.Applied.MinID != 20 || delta.Applied.MaxID != 20 || delta.FinalLatencyCursor != 20 {
+		t.Fatalf("unexpected sparse delta receipt: %+v", delta)
+	}
+	if sourceAfterDelta := fileDigest(t, sourcePath); sourceAfterDelta != sourceBeforeDelta {
+		t.Fatal("delta mutated the missing-checkpoint source SQLite file")
+	}
+
+	candidate := openRepairDB(t, frozenCandidatePath)
+	defer closeRepairDB(candidate)
+	assertLatencyCheckpoint(t, candidate, 20)
+	assertLatencySampleCounts(t, candidate, 5)
+	var storedSetting entities.AppSetting
+	if err := candidate.Where("setting_key = ?", "missing-checkpoint-repair-test").Take(&storedSetting).Error; err != nil || storedSetting.Value == nil || *storedSetting.Value != settingValue {
+		t.Fatalf("expected unrelated sparse S1 state to survive candidate promotion: row=%+v err=%v", storedSetting, err)
+	}
+}
+
+func TestStageRejectsDuplicateLatencyCheckpointRows(t *testing.T) {
+	requireRepairIntegrationPlatform(t)
+	location, err := time.LoadLocation("America/Toronto")
+	if err != nil {
+		t.Fatalf("load Toronto: %v", err)
+	}
+	now := time.Date(2026, 8, 22, 12, 0, 0, 0, location)
+	sourcePath, _ := makeRepairPair(t, now)
+	db := openRepairDB(t, sourcePath)
+	var checkpoints []entities.UsageAggregationCheckpoint
+	if err := db.Order("name").Find(&checkpoints).Error; err != nil {
+		t.Fatalf("load checkpoints before malformed schema rebuild: %v", err)
+	}
+	if err := db.Exec("DROP TABLE usage_aggregation_checkpoints").Error; err != nil {
+		t.Fatalf("drop checkpoint table: %v", err)
+	}
+	if err := db.Exec(`CREATE TABLE usage_aggregation_checkpoints (
+		name text NOT NULL,
+		last_aggregated_usage_event_id integer NOT NULL DEFAULT 0,
+		stats_updated_at datetime,
+		created_at datetime NOT NULL,
+		updated_at datetime NOT NULL,
+		CONSTRAINT chk_usage_aggregation_checkpoints_name CHECK (name IN ('overview','activity','latency'))
+	)`).Error; err != nil {
+		t.Fatalf("create malformed checkpoint table: %v", err)
+	}
+	if err := db.Create(&checkpoints).Error; err != nil {
+		t.Fatalf("restore checkpoints into malformed table: %v", err)
+	}
+	if err := db.Create(&entities.UsageAggregationCheckpoint{Name: entities.UsageAggregationCheckpointLatency, LastAggregatedUsageEventID: 4, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("insert duplicate latency checkpoint: %v", err)
+	}
+	closeRepairDB(db)
+	candidatePath := copySQLiteFile(t, sourcePath, "duplicate-checkpoint-candidate.db")
+
+	_, err = Stage(StageOptions{SourcePath: sourcePath, CandidatePath: candidatePath, ReceiptPath: filepath.Join(t.TempDir(), "duplicate-checkpoint-stage.json"), Now: now, RepairImage: testRepairImage(), ExpiresAt: time.Now().Add(time.Hour)})
+	if err == nil || !strings.Contains(err.Error(), "expected zero or one latency checkpoint, got 2") {
+		t.Fatalf("Stage error=%v, want duplicate latency checkpoint rejection", err)
+	}
+}
+
 func TestStageRefusesInPlaceMutationAndInterleavedPartition(t *testing.T) {
 	requireRepairIntegrationPlatform(t)
 	location, err := time.LoadLocation("America/Toronto")
@@ -398,6 +504,60 @@ func makeRepairPair(t *testing.T, now time.Time) (string, string) {
 		t.Fatalf("write candidate copy: %v", err)
 	}
 	return sourcePath, candidatePath
+}
+
+func makeSparseMissingCheckpointRepairPair(t *testing.T, now time.Time) (string, string) {
+	t.Helper()
+	sourcePath, _ := makeRepairPair(t, now)
+	db := openRepairDB(t, sourcePath)
+	if err := db.Exec("DELETE FROM usage_events_archive").Error; err != nil {
+		t.Fatalf("clear archive fixture: %v", err)
+	}
+	if err := db.Exec("DELETE FROM usage_events").Error; err != nil {
+		t.Fatalf("clear hot fixture: %v", err)
+	}
+	trueValue := true
+	archive := []entities.UsageEventArchive{
+		{ID: 1, EventKey: "archive-1", APIGroupKey: "group-a", Timestamp: now.Add(-5 * time.Minute), Generate: &trueValue, TTFTMS: int64Pointer(100), LatencyMS: 700},
+		{ID: 4, EventKey: "archive-4", APIGroupKey: "group-a", Timestamp: now.Add(-4 * time.Minute), Generate: &trueValue, TTFTMS: int64Pointer(110), LatencyMS: 710},
+	}
+	hot := []entities.UsageEvent{
+		{ID: 9, EventKey: "hot-9", APIGroupKey: "group-a", Timestamp: now.Add(-3 * time.Minute), Generate: &trueValue, TTFTMS: int64Pointer(120), LatencyMS: 720},
+		{ID: 12, EventKey: "hot-12", APIGroupKey: "group-a", Timestamp: now.Add(-2 * time.Minute), Generate: &trueValue, TTFTMS: int64Pointer(130), LatencyMS: 730},
+	}
+	if err := db.Create(&archive).Error; err != nil {
+		t.Fatalf("seed sparse archive: %v", err)
+	}
+	if err := db.Create(&hot).Error; err != nil {
+		t.Fatalf("seed sparse hot events: %v", err)
+	}
+	if err := db.Where("name = ?", entities.UsageAggregationCheckpointLatency).Delete(&entities.UsageAggregationCheckpoint{}).Error; err != nil {
+		t.Fatalf("remove latency checkpoint: %v", err)
+	}
+	closeRepairDB(db)
+	return sourcePath, copySQLiteFile(t, sourcePath, "sparse-missing-checkpoint-candidate.db")
+}
+
+func assertLatencyCheckpoint(t *testing.T, db *gorm.DB, expectedCursor int64) {
+	t.Helper()
+	var checkpoints []entities.UsageAggregationCheckpoint
+	if err := db.Where("name = ?", entities.UsageAggregationCheckpointLatency).Find(&checkpoints).Error; err != nil {
+		t.Fatalf("load latency checkpoints: %v", err)
+	}
+	if len(checkpoints) != 1 || checkpoints[0].LastAggregatedUsageEventID != expectedCursor {
+		t.Fatalf("latency checkpoints=%+v, want exactly one at cursor %d", checkpoints, expectedCursor)
+	}
+}
+
+func assertLatencySampleCounts(t *testing.T, db *gorm.DB, expected int64) {
+	t.Helper()
+	var rows []entities.UsageLatencyStat
+	if err := db.Order("bucket_type, bucket_start, api_group_key").Find(&rows).Error; err != nil {
+		t.Fatalf("load repaired latency rows: %v", err)
+	}
+	if len(rows) != 2 || rows[0].SampleCount != expected || rows[1].SampleCount != expected {
+		t.Fatalf("expected native hour/day rows with %d samples, got %+v", expected, rows)
+	}
 }
 
 func openRepairDB(t *testing.T, path string) *gorm.DB {
