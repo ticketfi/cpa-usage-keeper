@@ -516,6 +516,9 @@ func replaceLatencyAndReplayDelta(source, candidate, stageCandidate *gorm.DB, af
 }
 
 func replaceLatencyCheckpoint(tx *gorm.DB, checkpoint entities.UsageAggregationCheckpoint) error {
+	if err := ensureLatencyCheckpoint(tx, checkpoint); err != nil {
+		return err
+	}
 	result := tx.Model(&entities.UsageAggregationCheckpoint{}).
 		Where("name = ?", entities.UsageAggregationCheckpointLatency).
 		Updates(map[string]any{
@@ -529,6 +532,30 @@ func replaceLatencyCheckpoint(tx *gorm.DB, checkpoint entities.UsageAggregationC
 	}
 	if result.RowsAffected != 1 {
 		return fmt.Errorf("replace candidate latency checkpoint affected %d rows", result.RowsAffected)
+	}
+	return nil
+}
+
+func ensureLatencyCheckpoint(tx *gorm.DB, checkpoint entities.UsageAggregationCheckpoint) error {
+	if checkpoint.Name != entities.UsageAggregationCheckpointLatency {
+		return fmt.Errorf("candidate latency checkpoint has unexpected name %q", checkpoint.Name)
+	}
+	var count int64
+	if err := tx.Model(&entities.UsageAggregationCheckpoint{}).Where("name = ?", entities.UsageAggregationCheckpointLatency).Count(&count).Error; err != nil {
+		return fmt.Errorf("count candidate latency checkpoints: %w", err)
+	}
+	if count > 1 {
+		return fmt.Errorf("expected zero or one candidate latency checkpoint, got %d", count)
+	}
+	if count == 1 {
+		return nil
+	}
+	result := tx.Create(&checkpoint)
+	if result.Error != nil {
+		return fmt.Errorf("ensure candidate latency checkpoint: %w", result.Error)
+	}
+	if result.RowsAffected != 1 {
+		return fmt.Errorf("ensure candidate latency checkpoint affected %d rows", result.RowsAffected)
 	}
 	return nil
 }
@@ -570,6 +597,13 @@ func resetCandidateLatency(db *gorm.DB, now time.Time) error {
 	return db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Exec("DELETE FROM usage_latency_stats").Error; err != nil {
 			return fmt.Errorf("clear candidate usage latency stats: %w", err)
+		}
+		if err := ensureLatencyCheckpoint(tx, entities.UsageAggregationCheckpoint{
+			Name:      entities.UsageAggregationCheckpointLatency,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}); err != nil {
+			return err
 		}
 		result := tx.Model(&entities.UsageAggregationCheckpoint{}).
 			Where("name = ?", entities.UsageAggregationCheckpointLatency).
@@ -679,8 +713,8 @@ func requireRepairSchema(db *gorm.DB) error {
 	if err := db.Model(&entities.UsageAggregationCheckpoint{}).Where("name = ?", entities.UsageAggregationCheckpointLatency).Count(&latencyCount).Error; err != nil {
 		return fmt.Errorf("check latency checkpoint: %w", err)
 	}
-	if latencyCount != 1 {
-		return fmt.Errorf("expected exactly one latency checkpoint, got %d", latencyCount)
+	if latencyCount > 1 {
+		return fmt.Errorf("expected zero or one latency checkpoint, got %d", latencyCount)
 	}
 	return nil
 }
